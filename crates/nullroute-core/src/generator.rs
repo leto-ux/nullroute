@@ -159,6 +159,9 @@ pub fn rule_filename_for_slave(slave_name: &str) -> String {
 }
 
 /// Writes `10-sinks.conf` and all slave rule `.conf` files into the user's PipeWire config directories.
+/// If `backup` is true, any pre-existing original `.conf` file in those directories is renamed in-place
+/// with `.og` appended (e.g. `10-sinks.conf` -> `10-sinks.conf.og`, `browsers.conf` -> `browsers.conf.og`)
+/// so PipeWire ignores the original files while keeping them alongside the new configs.
 pub fn write_configs_to_disk(
     topology: &TopologyConfig,
     user_config_dir: &Path,
@@ -173,18 +176,11 @@ pub fn write_configs_to_disk(
     for dir in [&pw_conf_d, &pulse_conf_d, &client_conf_d] {
         fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create directory {}", dir.display()))?;
-    }
-
-    let backup_dir = user_config_dir.join("nullroute").join("backup");
-    if backup {
-        fs::create_dir_all(&backup_dir)?;
+        prepare_conf_directory(dir, backup)?;
     }
 
     // 1. Write `10-sinks.conf` into `pipewire.conf.d`
     let sinks_path = pw_conf_d.join("10-sinks.conf");
-    if backup && sinks_path.exists() {
-        let _ = fs::copy(&sinks_path, backup_dir.join("10-sinks.conf.bak"));
-    }
     let sinks_content = generate_sinks_conf(topology);
     fs::write(&sinks_path, sinks_content)
         .with_context(|| format!("Failed to write {}", sinks_path.display()))?;
@@ -198,10 +194,6 @@ pub fn write_configs_to_disk(
         let filename = rule_filename_for_slave(&slave.name);
         for target_dir in [&pw_conf_d, &pulse_conf_d, &client_conf_d] {
             let file_path = target_dir.join(&filename);
-            if backup && file_path.exists() {
-                let _ = fs::copy(&file_path, backup_dir.join(format!("{}.bak", filename)));
-            }
-            // If file is a hardlink, remove before writing so we write cleanly or replace in all 3 dirs
             let _ = fs::remove_file(&file_path);
             fs::write(&file_path, &rule_content)
                 .with_context(|| format!("Failed to write {}", file_path.display()))?;
@@ -210,6 +202,48 @@ pub fn write_configs_to_disk(
     }
 
     Ok(written)
+}
+
+/// Scans a PipeWire `.conf.d` directory prior to writing new configs:
+/// - Any non-nullroute `.conf` file is renamed to `<filename>.og` (when `backup` is true and `<filename>.og` does not yet exist).
+/// - Any previously generated `# Managed by nullroute` `.conf` file is removed so stale rules don't linger.
+fn prepare_conf_directory(dir: &Path, backup: bool) -> Result<()> {
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("Failed to read directory {}", dir.display()))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("conf") {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_managed = fs::read_to_string(&path)
+            .map(|c| c.starts_with("# Managed by nullroute"))
+            .unwrap_or(false);
+
+        if is_managed {
+            let _ = fs::remove_file(&path);
+        } else if backup {
+            let og_path = dir.join(format!("{}.og", file_name));
+            if !og_path.exists() {
+                fs::rename(&path, &og_path).with_context(|| {
+                    format!(
+                        "Failed to rename original config {} -> {}",
+                        path.display(),
+                        og_path.display()
+                    )
+                })?;
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn escape_str(s: &str) -> String {
@@ -265,5 +299,46 @@ mod tests {
         assert!(others_conf.contains("!factorio"));
         assert!(others_conf.contains("!game"));
         assert!(parse_spa_conf(&others_conf).is_ok());
+    }
+
+    #[test]
+    fn test_preserve_original_configs_as_og() {
+        let tmp = std::env::temp_dir().join(format!("nullroute_og_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let pw_conf_d = tmp.join("pipewire").join("pipewire.conf.d");
+        fs::create_dir_all(&pw_conf_d).unwrap();
+
+        let original_sinks = "## user original 10-sinks\ncontext.objects = []\n";
+        let original_custom = "## user original custom\nstream.rules = []\n";
+        fs::write(pw_conf_d.join("10-sinks.conf"), original_sinks).unwrap();
+        fs::write(pw_conf_d.join("custom.conf"), original_custom).unwrap();
+
+        let mut topo = TopologyConfig::default();
+        topo.masters.push(MasterSink {
+            name: "Master".into(),
+            description: None,
+            object_id: Some(10000),
+            channel_map: ChannelMap::Stereo,
+            hardware_targets: vec![],
+        });
+
+        // First apply: renames 10-sinks.conf -> 10-sinks.conf.og and custom.conf -> custom.conf.og
+        write_configs_to_disk(&topo, &tmp, true).unwrap();
+        assert!(pw_conf_d.join("10-sinks.conf.og").exists());
+        assert!(pw_conf_d.join("custom.conf.og").exists());
+        assert!(!pw_conf_d.join("custom.conf").exists());
+        assert_eq!(
+            fs::read_to_string(pw_conf_d.join("10-sinks.conf.og")).unwrap(),
+            original_sinks
+        );
+
+        // Second apply: must NOT overwrite 10-sinks.conf.og with nullroute's generated file
+        write_configs_to_disk(&topo, &tmp, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(pw_conf_d.join("10-sinks.conf.og")).unwrap(),
+            original_sinks
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
